@@ -1,15 +1,11 @@
-#Requires -Modules Microsoft.Graph.Users, Microsoft.Graph.Identity.DirectoryManagement
-
-<#
+<# 
 .SYNOPSIS
-    Removes a custom domain from EVERY user in the tenant (UPN, mail, proxyAddresses)
-    Works even if you accidentally copied a broken version before
+    Completely removes a custom domain from ALL users in the tenant
+                 (UPN, mail attribute and all proxyAddresses)
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
-    # ← this was missing in your broken copy
-(
     [Parameter(Mandatory = $true)]
     [string]$CustomDomain,
 
@@ -20,102 +16,95 @@ param(
     [string]$TenantId
 )
 
-function Write-Color {
-    param(
-        [string]$Text,
-        [string]$Color = "White"
-    )
+function Write-Color([string]$Text, [string]$Color = "White") {
     Write-Host $Text -ForegroundColor $Color
 }
 
-# Install modules if missing
-foreach ($mod in "Microsoft.Graph.Users", "Microsoft.Graph.Identity.DirectoryManagement") {
-    if (-not (Get-Module -ListAvailable -Name $mod)) {
-        Write-Color "Installing module $mod ..." "Yellow"
-        Install-Module $mod -Scope CurrentUser -Force -AllowClobber
+# --- Ensure modules are available -------------------------------------------------
+@("Microsoft.Graph.Users", "Microsoft.Graph.Identity.DirectoryManagement") | ForEach-Object {
+    if (-not (Get-Module -ListAvailable -Name $_)) {
+        Write-Color "Installing module $_ ..." "Yellow"
+        Install-Module $_ -Scope CurrentUser -Force -AllowClobber
     }
-    Import-Module $mod -Force
+    Import-Module $_ -Force
 }
 
-# ===================================================================
-# MAIN SCRIPT
-# ===================================================================
+# --- Main script ------------------------------------------------------------------
 try {
-    Write-Color "`n=== COMPLETE CUSTOM DOMAIN CLEANUP ===`n" "Cyan"
-    Write-Color "Removing domain : $CustomDomain" "Red"
-    Write-Color "Fallback domain : $OnMicrosoftDomain`n" "Green"
+    Write-Color "`n=== CUSTOM DOMAIN CLEANUP SCRIPT ===`n" "Cyan"
+    Write-Color "Domain to remove : $CustomDomain" "Red"
+    Write-Color "Fallback domain  : $OnMicrosoftDomain`n" "Green"
 
-    # Connect
+    # Connect to Graph
     $scopes = "User.ReadWrite.All", "Directory.ReadWrite.All"
     if ($TenantId) {
         Connect-MgGraph -Scopes $scopes -TenantId $TenantId -NoWelcome
-        Write-Color "Targeting tenant: $TenantId" "Cyan"
+        Write-Color "Targeting tenant : $TenantId" "Cyan"
     } else {
         Connect-MgGraph -Scopes $scopes -NoWelcome
     }
 
-    $tenant = (Get-MgContext).TenantId
-    Write-Color "Successfully connected to tenant: $tenant`n" "Green"
+    Write-Color "Connected to tenant : $((Get-MgContext).TenantId)`n" "Green"
 
-    # Get ALL users
-    Write-Color "Retrieving ALL users in the tenant..." "Yellow"
-    $allUsers = Get-MgUser -All -Property Id, UserPrincipalName, DisplayName, Mail, ProxyAddresses
+    # Get every user
+    Write-Color "Retrieving ALL users..." "Yellow"
+    $users = Get-MgUser -All -Property Id, UserPrincipalName, DisplayName, Mail, ProxyAddresses
 
-    Write-Color "Found $($allUsers.Count) users. Starting cleanup...`n" "Green"
+    Write-Color "Found $($users.Count) users. Processing...`n" "Green"
 
-    $results  = @()
-    $changed  = 0
-    $skipped  = 0
+    $results   = @()
+    $changed   = 0
+    # includes WhatIf
     $unchanged = 0
+    $skipped   = 0
 
-    foreach ($user in $allUsers) {
+    foreach ($user in $users) {
         $oldUPN       = $user.UserPrincipalName
-        $usernamePart = $oldUPN.Split('@')[0]
-        $newUPN       = "$usernamePart@$OnMicrosoftDomain"
+        $username     = $oldUPN.Split('@')[0]
+        $newUPN       = "$username@$OnMicrosoftDomain"
+        $needsUpdate  = $false
+        $body         = @{}
 
-        $needsUpdate = $false
-        $body    = @{}
+        Write-Color "User: $($user.DisplayName)  ($oldUPN)" "Cyan"
 
-        Write-Color "Processing → $($user.DisplayName) ($oldUPN)" "Cyan"
-
-        # 1. UPN
+        # 1. Fix UPN if needed
         if ($oldUPN -like "*@$CustomDomain") {
-            Write-Color "   • Changing UPN → $newUPN" "Yellow"
+            Write-Color "   → Changing UPN to $newUPN" "Yellow"
             $body.userPrincipalName = $newUPN
             $needsUpdate = $true
         }
 
-        # 2. Mail attribute
+        # 2. Fix mail attribute if needed
         if ($user.Mail -and $user.Mail -like "*@$CustomDomain") {
-            Write-Color "   • Changing mail → $newUPN" "Yellow"
+            Write-Color "   → Changing mail to $newUPN" "Yellow"
             $body.mail = $newUPN
             $needsUpdate = $true
         }
 
-        # 3. ProxyAddresses
+        # 3. Clean proxyAddresses
         $newProxy   = @()
         $removed    = 0
         $hasPrimary = $false
 
-        foreach ($p in $user.ProxyAddresses) {
-            if ($p -match "(?i)@$CustomDomain") {
-                Write-Color "     Removing proxy: $p" "DarkGray"
+        foreach ($proxy in $user.ProxyAddresses) {
+            if ($proxy -match "(?i)@$CustomDomain") {
+                Write-Color "      Removing → $proxy" "DarkGray"
                 $removed++
                 continue
             }
-            if ($p -eq "SMTP:$newUPN") { $hasPrimary = $true }
-            $newProxy += $p
+            if ($proxy -eq "SMTP:$newUPN") { $hasPrimary = $true }
+            $newProxy += $proxy
         }
 
         if ($removed -gt 0) {
-            Write-Color "   • Removed $removed proxy address(es)" "Magenta"
+            Write-Color "   → Removed $removed proxy address(es)" "Magenta"
             $needsUpdate = $true
         }
 
-        # Make sure new address is primary
+        # Ensure the new address is the primary SMTP
         if ($oldUPN -like "*@$CustomDomain" -or -not $hasPrimary) {
             $newProxy = @("SMTP:$newUPN") + ($newProxy | Where-Object { $_ -notlike "SMTP:*" })
-            Write-Color "   • Set primary SMTP: SMTP:$newUPN" "Gray"
+            Write-Color "   → Set primary address SMTP:$newUPN" "Gray"
         }
 
         if ($newProxy.Count -gt 0) {
@@ -124,7 +113,7 @@ try {
 
         # Nothing to do?
         if (-not $needsUpdate) {
-            Write-Color "   → No changes needed`n" "Gray"
+            Write-Color "   No changes needed`n" "Gray"
             $unchanged++
             continue
         }
@@ -138,47 +127,46 @@ try {
                 $results += [pscustomobject]@{
                     DisplayName = $user.DisplayName
                     OldUPN      = $oldUPN
-                    IntendedUPN = $newUPN
-                    Status      = "Skipped – UPN conflict"
+                    NewUPN      = $newUPN
+                    Status      = "Skipped - UPN conflict"
                 }
                 continue
             }
         }
 
-        # Apply or WhatIf
-        if ($PSCmdlet.ShouldProcess($oldUPN, "Remove $CustomDomain (UPN/mail/proxy)")) {
+        # Apply changes (or WhatIf)
+        if ($PSCmdlet.ShouldProcess($oldUPN, "Remove $CustomDomain from UPN/mail/proxyAddresses")) {
             Update-MgUser -UserId $user.Id -BodyParameter $body
             Write-Color "   SUCCESS`n" "Green"
-            $changed++
         } else {
             Write-Color "   WHATIF – changes would be applied`n" "Magenta"
-            $changed++
         }
+        $changed++
 
         $results += [pscustomobject]@{
-            DisplayName     = $user.DisplayName
-            OldUPN          = $oldUPN
-            NewUPN          = $newUPN
-            ProxiesRemoved  = $removed
-            Status          = if ($PSCmdlet.ShouldProcess) { "Success" else "WhatIf"
+            DisplayName    = $user.DisplayName
+            OldUPN         = $oldUPN
+            NewUPN         = $newUPN
+            ProxiesRemoved = $removed
+            Status         = if ($PSCmdlet.ShouldProcess) { "Success" } else { "WhatIf" }
         }
     }
 
-    # Summary
-    Write-Color "=== CLEANUP COMPLETE ===" "Cyan"
-    Write-Color "Scanned    : $($allUsers.Count)" "White"
-    Write-Color "Changed    : $changed" "Green"
-    Write-Color "Unchanged  : $unchanged" "Gray"
-    Write-Color "Skipped    : $skipped`n" "Yellow"
+    # Final report
+    Write-Color "=== SUMMARY ===" "Cyan"
+    Write-Color "Total users   : $($users.Count)" "White"
+    Write-Color "Changed       : $changed" "Green"
+    Write-Color "Unchanged     : $unchanged" "Gray"
+    Write-Color "Skipped       : $skipped`n" "Yellow"
 
-    $csv = ".\Cleanup_$CustomDomain_$(Get-Date -Format yyyyMMdd_HHmmss).csv"
-    $results | Export-Csv -Path $csv -NoTypeInformation
-    Write-Color "Full report → $csv" "Cyan"
+    $csvFile = "CleanupResults_$CustomDomain_$(Get-Date -Format yyyyMMdd_HHmmss).csv"
+    $results | Export-Csv -Path $csvFile -NoTypeInformation
+    Write-Color "Detailed report saved to: $csvFile" "Cyan"
 
-    Disconnect-MgGraph | Out-Null
+    Disconnect-MgGraph -ErrorAction SilentlyContinue
 }
 catch {
-    Write-Color "`nFATAL ERROR: $($_.Exception.Message)" "Red"
+    Write-Color "`nERROR: $($_.Exception.Message)" "Red"
     Write-Error $_
     Disconnect-MgGraph -ErrorAction SilentlyContinue
 }
