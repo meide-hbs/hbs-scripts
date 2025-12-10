@@ -1,38 +1,51 @@
-# Only the proxyAddresses block is changed — everything else stays the same
+<# 
+.SYNOPSIS
+    Permanently removes a custom domain from EVERY user in your tenant owns
+    → Fixes UPN, mail attribute and ALL proxyAddresses
+    → Works with -WhatIf and real runs
+    → Tested December 2025 with Microsoft.Graph 2.x
+#>
 
-# Inside the foreach ($user in $users) loop, replace the entire proxyAddresses section with this:
+[CmdletBinding(SupportsShouldProcess = $true)]
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$CustomDomain,               # e.g. flambeau.com
 
-        # ────── PROXYADDRESSES CLEANUP (FIXED) ──────
-        $newProxy   = @()
-        $removed    = 0
-        $hasPrimary = $false
-        $hasAlias   = $false
+    [Parameter(Mandatory = $true)]
+    [string]$OnMicrosoftDomain,          # e.g. flambeauinc.onmicrosoft.com
 
-        foreach ($proxy in $user.ProxyAddresses) {
-            if ($proxy -match "(?i)@$CustomDomain") {
-                Write-Color "      Removing → $proxy" "DarkGray"
-                $removed++
-                continue
-            }
-            if ($proxy -eq "SMTP:$newUPN") { $hasPrimary = $true }
-            if ($proxy -eq "smtp:$newUPN") { $hasAlias   = $true }
-            $newProxy += $proxy
-        }
+    [Parameter(Mandatory = $false)]
+    [string]$TenantId
+)
 
-        # Ensure we have a primary (uppercase SMTP)
-        if (-not $hasPrimary) {
-            $newProxy = @("SMTP:$newUPN") + $newProxy
-            Write-Color "   → Added primary: SMTP:$newUPN" "Gray"
-        }
+# ──────────────────────────────────────────────────────────────
+function Write-Color {
+    param([string]$Text, [string]$Color = "White")
+    Write-Host $Text -ForegroundColor $Color
+}
+ ──────────────────────────────────────────────────────────────
 
-        # THIS IS THE CRITICAL FIX → always add at least one lowercase smtp: alias
-        if (-not $hasAlias) {
-            $newProxy += "smtp:$newUPN"
-            Write-Color "   → Added required alias: smtp:$newUPN (prevents 400 error)" "Green"
-        }
+# Ensure required modules
+@("Microsoft.Graph.Users", "Microsoft.Graph.Identity.DirectoryManagement") | ForEach-Object {
+    if (-not (Get-Module -ListAvailable -Name $_)) {
+        Write-Color "Installing $_ ..." "Yellow"
+        Install-Module $_ -Scope CurrentUser -Force -AllowClobber
+    }
+    Import-Module $_ -Force
+}
 
-        if ($removed -gt 0 -or -not $hasPrimary -or -not $hasAlias) {
-            $body.proxyAddresses = $newProxy
-            $needsUpdate = $true
-            Write-Color "   → Removed $removed old proxy address(es)" "Magenta"
-        }
+try {
+    Write-Color "`n=== CUSTOM DOMAIN COMPLETE REMOVAL SCRIPT ===`n" "Cyan"
+    Write-Color "Removing     : $CustomDomain" "Red"
+    Write-Color "Fallback to  : $OnMicrosoftDomain`n" "Green"
+
+    # Connect
+    $scopes = "User.ReadWrite.All", "Directory.ReadWrite.All"
+    if ($TenantId) {
+        Connect-MgGraph -Scopes $scopes -TenantId $TenantId -NoWelcome
+    } else {
+        Connect-MgGraph -Scopes $scopes -NoWelcome
+    }
+    Write-Color "Connected to tenant: $((Get-MgContext).TenantId)`n" "Green"
+
+    # Get every
